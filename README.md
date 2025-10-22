@@ -160,9 +160,13 @@ Project Structure
 text
 
 pico-stepper-controller/
+
 ├── Pico_stepper_1sm_v2.ino    # Main Arduino sketch
+
 ├── stepper_1sm.pio.h          # PIO assembly program
+
 └── README.md                  # This file
+
 
 Applications
 
