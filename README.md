@@ -170,13 +170,9 @@ pico-stepper-controller/
 
 Applications
 
-3D Printers & CNC Machines
-
 Robotics & Automation
 
 Precision positioning systems
-
-Laser cutters & plotters
 
 Custom motion control projects
 
