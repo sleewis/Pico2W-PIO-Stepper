@@ -1,16 +1,5 @@
-/*
-G28             ; Home to origin
-M114            ; Check position (should be 0,0,0)
-G1 X1000 F1000  ; Move 1000 steps on X
-M114            ; Check position (should be 1000,0,0)
-G1 Y500 F500    ; Move 500 steps on Y
-M114            ; Check position
-
-PINS: Dir+ XYZ [0..2] Pulse+ [3..5]
-*/
-
-// Pico2W_stepper_1sm_V3 – Simplified DMA approach - With Move Queue
-// More reliable DMA initialization and operation
+// Pico2W_Simple_Stepper3 - TRUE Real-time Position Tracking
+// Uses DMA transfer count for exact step counting
 
 #include <Arduino.h>
 extern "C" {
@@ -83,10 +72,88 @@ void pio_stepper_init() {
 }
 
 // =============================
+// TRUE REAL-TIME POSITION TRACKING
+// =============================
+
+static volatile bool move_done_irq_flag = false;  // NEW
+
+// Global position counters
+static volatile int32_t realtime_X = 0;
+static volatile int32_t realtime_Y = 0; 
+static volatile int32_t realtime_Z = 0;
+
+// Track the actual commands processed vs generated
+static uint32_t total_commands_generated = 0;
+static uint32_t total_commands_processed = 0;
+
+// Per-move / per-buffer DMA accounting
+static volatile uint32_t dma_move_sent_prev = 0;     // words fully sent in previous buffers (this move)
+static volatile uint32_t dma_active_len     = 0;     // words in the currently active DMA transfer
+static volatile uint32_t dma_processed_in_buf = 0;   // words we've already parsed in the current buffer
+
+// Helper
+static inline void read_positions_atomic(int32_t& x, int32_t& y, int32_t& z) {
+  noInterrupts();
+  x = realtime_X; y = realtime_Y; z = realtime_Z;
+  interrupts();
+}
+
+// Current move tracking
+static struct {
+  bool dx, dy, dz;  // Direction flags for current move
+  uint32_t total_commands;  // Total commands in current move
+} current_move = {false, false, false, 0};
+
+// Function to parse step command and update positions
+// FIXED: Process step command without double-counting
+void process_step_command(uint32_t command) {
+  // Extract direction and step bits from command
+  uint32_t dir_bits = command & 0x7;
+  uint32_t step_bits = (command >> 3) & 0x7;
+  
+  // Update positions based on which steps are active
+  if (step_bits & (1u << 0)) { // X step
+    if (dir_bits & (1u << 0)) {
+      realtime_X++;
+    } else {
+      realtime_X--;
+    }
+  }
+  
+  if (step_bits & (1u << 1)) { // Y step
+    if (dir_bits & (1u << 1)) {
+      realtime_Y++;
+    } else {
+      realtime_Y--;
+    }
+  }
+  
+  if (step_bits & (1u << 2)) { // Z step
+    if (dir_bits & (1u << 2)) {
+      realtime_Z++;
+    } else {
+      realtime_Z--;
+    }
+  }
+  
+  total_commands_processed++;
+}
+
+
+// =============================
 // Motion planning
 // =============================
 
-struct TrapDDA {
+// =============================
+// FIXED Motion planning - Exact Step Counting
+// =============================
+
+// === Jerk-gelimiteerde S-curve planner (drop-in) ============================
+#include <math.h>
+#include <algorithm>
+using std::max;
+
+struct TrapS {
   uint32_t Nx, Ny, Nz;
   uint32_t Nmax;
   Axis     master;
@@ -98,8 +165,18 @@ struct TrapDDA {
   enum Phase { ACCEL, CRUISE, DECEL, DONE } phase;
   uint32_t i_in_phase;
 
-  uint32_t ex, ey, ez;
-  int32_t curX=0, curY=0, curZ=0;
+  // Bresenham error-accu's voor de slave-assen
+  int32_t ex, ey, ez;
+
+  // Debug/telemetry
+  uint32_t total_steps_generated;
+
+  static inline float smooth5(float t) {
+    if (t <= 0.0f) return 0.0f;
+    if (t >= 1.0f) return 1.0f;
+    // 6t^5 - 15t^4 + 10t^3  -> C2-continu (jerk=0 op de randen)
+    return t*t*t*(10.0f + t*(-15.0f + 6.0f*t));
+  }
 
   void init(const LineMove& m, int32_t cur_x, int32_t cur_y, int32_t cur_z) {
     int32_t dxs = m.sx - cur_x;
@@ -115,85 +192,106 @@ struct TrapDDA {
     dx = (dxs >= 0); dy = (dys >= 0); dz = (dzs >= 0);
     master = (Nmax==Nx)?AXIS_X:((Nmax==Ny)?AXIS_Y:AXIS_Z);
 
+    // Zelfde segmentverdeling als je oude code
     steps_acc   = (uint32_t)roundf(m.accel_frac * Nmax);
     steps_decel = (uint32_t)roundf(m.decel_frac * Nmax);
-    if (steps_acc + steps_decel > Nmax) { 
-      steps_acc = Nmax/2; 
-      steps_decel = Nmax - steps_acc; 
+    if (steps_acc + steps_decel > Nmax) {
+      steps_acc = Nmax/2;
+      steps_decel = Nmax - steps_acc;
     }
     steps_cruise = Nmax - steps_acc - steps_decel;
 
-    d_start  = (int32_t)m.d_start_us;
-    d_cruise = (int32_t)m.d_cruise_us;
-    d_end    = (int32_t)m.d_end_us;
+    d_start  = (int32_t)m.d_start_us;   // langzame start (grote periode)
+    d_cruise = (int32_t)m.d_cruise_us;  // doel-snelheid
+    d_end    = (int32_t)m.d_end_us;     // langzame eindperiode
 
     phase = (steps_acc?ACCEL:(steps_cruise?CRUISE:(steps_decel?DECEL:DONE)));
-    i_in_phase = 0; 
+    i_in_phase = 0;
     d_cur = d_start;
 
-    ex = ey = ez = 0;
-    curX = cur_x; curY = cur_y; curZ = cur_z;
+    ex = ey = ez = -(int32_t)Nmax/2;
+    total_steps_generated = 0;
   }
 
   size_t fill(uint32_t* out, size_t cap) {
-    size_t n = 0; 
+    size_t n = 0;
     if (phase==DONE) return 0;
-    
+
     while (n < cap && phase != DONE) {
+      // --- Bepaal welke as(sen) stappen (Bresenham) ---
       bool sxp=false, syp=false, szp=false;
       switch (master) {
-        case AXIS_X: 
-          sxp = true; 
-          ey += Ny; if (ey >= Nmax){ ey -= Nmax; syp = (Ny!=0);} 
-          ez += Nz; if (ez>=Nmax){ ez -= Nmax; szp=(Nz!=0);} 
+        case AXIS_X:
+          sxp = true;
+          ey += (int32_t)Ny; if (ey >= 0) { ey -= (int32_t)Nmax; syp = true; }
+          ez += (int32_t)Nz; if (ez >= 0) { ez -= (int32_t)Nmax; szp = true; }
           break;
-        case AXIS_Y: 
-          syp = true; 
-          ex += Nx; if (ex >= Nmax){ ex -= Nmax; sxp = (Nx!=0);} 
-          ez += Nz; if (ez>=Nmax){ ez -= Nmax; szp=(Nz!=0);} 
+        case AXIS_Y:
+          syp = true;
+          ex += (int32_t)Nx; if (ex >= 0) { ex -= (int32_t)Nmax; sxp = true; }
+          ez += (int32_t)Nz; if (ez >= 0) { ez -= (int32_t)Nmax; szp = true; }
           break;
-        case AXIS_Z: 
-          szp = true; 
-          ex += Nx; if (ex >= Nmax){ ex -= Nmax; sxp = (Nx!=0);} 
-          ey += Ny; if (ey>=Nmax){ ey -= Nmax; syp=(Ny!=0);} 
+        case AXIS_Z:
+          szp = true;
+          ex += (int32_t)Nx; if (ex >= 0) { ex -= (int32_t)Nmax; sxp = true; }
+          ey += (int32_t)Ny; if (ey >= 0) { ey -= (int32_t)Nmax; syp = true; }
           break;
       }
 
-      uint32_t dt_total = (d_cur < 0) ? 0u : (uint32_t)d_cur;
-      const uint32_t PULSE_US = 20;
-      uint32_t extra = (dt_total > PULSE_US) ? (dt_total - PULSE_US) : 0u;
-      out[n++] = make_cmd(dx,dy,dz, sxp,syp,szp, extra);
+      // --- S-curve tijdsprofiel: bepaal d_cur per fase via quintic smoothstep ---
+      switch (phase) {
+        case ACCEL: {
+          if (steps_acc == 0) { d_cur = d_cruise; }
+          else {
+            float t = (float)i_in_phase / (float)steps_acc;
+            float s = smooth5(t);
+            // Van langzame periode -> snelle periode (monotoon dalend)
+            d_cur = (int32_t)lrintf((1.0f - s) * (float)d_start + s * (float)d_cruise);
+          }
+        } break;
 
-      if (sxp) curX += dx?+1:-1; 
-      if (syp) curY += dy?+1:-1; 
-      if (szp) curZ += dz?+1:-1;
+        case CRUISE:
+          d_cur = d_cruise;
+          break;
 
+        case DECEL: {
+          if (steps_decel == 0) { d_cur = d_end; }
+          else {
+            float t = (float)i_in_phase / (float)steps_decel;
+            float s = smooth5(t);
+            // Van cruise periode -> langzame eindperiode (monotoon stijgend)
+            d_cur = (int32_t)lrintf((1.0f - s) * (float)d_cruise + s * (float)d_end);
+          }
+        } break;
+
+        default: break;
+      }
+
+      if (d_cur < 0) d_cur = 0;
+      const uint32_t PULSE_US = 20; // jouw vaste pulswijdte
+      uint32_t extra = ( (uint32_t)d_cur > PULSE_US ) ? ( (uint32_t)d_cur - PULSE_US ) : 0u;
+
+      out[n++] = make_cmd(dx, dy, dz, sxp, syp, szp, extra);
+      total_steps_generated++;
+
+      // --- Faseboekhouding ---
       i_in_phase++;
       switch (phase) {
         case ACCEL:
-          if (i_in_phase >= steps_acc) { 
-            phase = (steps_cruise?CRUISE:(steps_decel?DECEL:DONE)); 
-            i_in_phase = 0; 
-            d_cur = d_cruise; 
-          } else {
-            float t = (float)i_in_phase / (float)steps_acc;
-            float eased_t = t * t;
-            d_cur = (int32_t)(d_start + (d_cruise - d_start) * eased_t);
+          if (i_in_phase >= steps_acc) {
+            phase = (steps_cruise?CRUISE:(steps_decel?DECEL:DONE));
+            i_in_phase = 0;
           }
           break;
         case CRUISE:
-          if (i_in_phase >= steps_cruise) { 
-            phase = (steps_decel?DECEL:DONE); 
-            i_in_phase = 0; 
+          if (i_in_phase >= steps_cruise) {
+            phase = (steps_decel?DECEL:DONE);
+            i_in_phase = 0;
           }
           break;
         case DECEL:
-          if (i_in_phase >= steps_decel) { 
-            phase = DONE; 
-          } else {
-            float t = (float)i_in_phase / (float)steps_decel;
-            float eased_t = 1.0f - (1.0f - t) * (1.0f - t);
-            d_cur = (int32_t)(d_cruise + (d_end - d_cruise) * eased_t);
+          if (i_in_phase >= steps_decel) {
+            phase = DONE;
           }
           break;
         default: break;
@@ -202,6 +300,7 @@ struct TrapDDA {
     return n;
   }
 };
+
 
 // =============================
 // Move Queue Implementation
@@ -212,17 +311,14 @@ static volatile uint8_t queueHead = 0;
 static volatile uint8_t queueTail = 0;
 static volatile uint8_t queueCount = 0;
 
-// Check if queue is empty
 bool is_queue_empty() {
   return queueCount == 0;
 }
 
-// Check if queue is full
 bool is_queue_full() {
   return queueCount >= MOVE_QUEUE_SIZE;
 }
 
-// Add move to queue
 bool queue_move(const LineMove& move) {
   if (is_queue_full()) {
     return false;
@@ -234,7 +330,6 @@ bool queue_move(const LineMove& move) {
   return true;
 }
 
-// Get next move from queue
 bool dequeue_move(LineMove* move) {
   if (is_queue_empty()) {
     return false;
@@ -246,38 +341,157 @@ bool dequeue_move(LineMove* move) {
   return true;
 }
 
-// Clear all moves from queue
 void clear_queue() {
   queueHead = 0;
   queueTail = 0;
   queueCount = 0;
 }
 
-// Get queue status
 uint8_t get_queue_count() {
   return queueCount;
 }
 
 // =============================
-// DMA and Motion Control
+// Homing Emergency Stop System
 // =============================
-static constexpr size_t BUFFER_SIZE = 512;
+
+const uint HOME_X_PIN = 20;
+const uint HOME_Y_PIN = 21;
+//const uint HOME_Z_PIN = 8;
+
+volatile bool homing_triggered = false;
+volatile uint triggered_sensor = 0;
+volatile bool homing_enabled = false;
+
+// =============================
+// DMA with TRUE REAL-TIME POSITION TRACKING
+// =============================
+static constexpr size_t BUFFER_SIZE = 512;  // Smaller buffer for more frequent updates
 static uint32_t command_buffer[BUFFER_SIZE];
 static int dma_channel = -1;
 static volatile bool motion_active = false;
 static volatile bool motion_complete = false;
 
-static TrapDDA g_gen;
-static int32_t gCurX=0, gCurY=0, gCurZ=0;
+static TrapS g_gen;
+
+void emergency_stop() {
+  if (dma_channel >= 0) dma_channel_abort(dma_channel);
+  pio_sm_set_enabled(pio, sm, false);
+  pio_sm_clear_fifos(pio, sm);
+  clear_queue();
+  motion_active = false;
+  motion_complete = false;
+}
+
+void stop_motion() {
+  if (dma_channel >= 0) dma_channel_abort(dma_channel);
+  pio_sm_set_enabled(pio, sm, false);
+  pio_sm_clear_fifos(pio, sm);
+  motion_active = false;
+  motion_complete = false;
+}
+
+void homing_isr(uint gpio, uint32_t events) {
+  if (homing_enabled && (events & GPIO_IRQ_LEVEL_LOW)) {
+    triggered_sensor = gpio;
+    homing_triggered = true;
+    
+    emergency_stop();
+    
+    homing_enabled = false;
+    gpio_set_irq_enabled(HOME_X_PIN, GPIO_IRQ_LEVEL_LOW, false);
+    gpio_set_irq_enabled(HOME_Y_PIN, GPIO_IRQ_LEVEL_LOW, false);
+    //gpio_set_irq_enabled(HOME_Z_PIN, GPIO_IRQ_EDGE_FALL, false);
+  }
+}
+
+void setup_homing_sensors() {
+  gpio_init(HOME_X_PIN);
+  gpio_set_dir(HOME_X_PIN, GPIO_IN);
+  gpio_pull_up(HOME_X_PIN);
+  
+  gpio_init(HOME_Y_PIN);
+  gpio_set_dir(HOME_Y_PIN, GPIO_IN);
+  gpio_pull_up(HOME_Y_PIN);
+  
+  //gpio_init(HOME_Z_PIN);
+  //gpio_set_dir(HOME_Z_PIN, GPIO_IN);
+  //gpio_pull_up(HOME_Z_PIN);
+  
+  gpio_set_irq_enabled_with_callback(HOME_X_PIN, GPIO_IRQ_LEVEL_LOW, false, &homing_isr);
+  gpio_set_irq_enabled(HOME_Y_PIN, GPIO_IRQ_EDGE_FALL, false);
+  //gpio_set_irq_enabled(HOME_Z_PIN, GPIO_IRQ_EDGE_FALL, false);
+  
+  homing_enabled = false;
+}
+
+void enable_homing_sensors() {
+  homing_enabled = true;
+  gpio_set_irq_enabled(HOME_X_PIN, GPIO_IRQ_LEVEL_LOW, true);
+  gpio_set_irq_enabled(HOME_Y_PIN, GPIO_IRQ_LEVEL_LOW, true);
+  //gpio_set_irq_enabled(HOME_Z_PIN, GPIO_IRQ_EDGE_FALL, true);
+  Serial.println("Homing sensors ENABLED");
+}
+
+void disable_homing_sensors() {
+  homing_enabled = false;
+  gpio_set_irq_enabled(HOME_X_PIN, GPIO_IRQ_LEVEL_LOW, false);
+  gpio_set_irq_enabled(HOME_Y_PIN, GPIO_IRQ_LEVEL_LOW, false);
+  //gpio_set_irq_enabled(HOME_Z_PIN, GPIO_IRQ_EDGE_FALL, false);
+  Serial.println("Homing sensors DISABLED");
+}
+
+void check_homing_safety() {
+  if (homing_triggered) {
+    homing_triggered = false;
+    
+    Serial.println();
+    Serial.println("!!! EMERGENCY STOP - Homing Sensor Triggered !!!");
+    Serial.print("Sensor on GPIO: "); Serial.println(triggered_sensor);
+    Serial.print("Stopped at X:"); Serial.print(realtime_X);
+    Serial.print(" Y:"); Serial.print(realtime_Y);
+    Serial.print(" Z:"); Serial.println(realtime_Z);
+    Serial.println("All motion stopped and queue cleared");
+    Serial.println("Use M121 to disable sensors, then resume with G-code");
+  }
+}
+
+// Get the number of commands actually transferred by DMA
+uint32_t get_dma_transferred_count_cumulative() {
+  if (!motion_active || dma_channel < 0) return dma_move_sent_prev + dma_processed_in_buf;
+  uint32_t remaining = dma_channel_hw_addr(dma_channel)->transfer_count;
+  uint32_t sent_in_buf = (dma_active_len > remaining) ? (dma_active_len - remaining) : 0;
+  return dma_move_sent_prev + sent_in_buf;
+}
+
+void update_realtime_positions_from_dma() {
+  if (!motion_active || dma_channel < 0 || dma_active_len == 0) return;
+  uint32_t remaining = dma_channel_hw_addr(dma_channel)->transfer_count;
+  uint32_t sent_in_buf = (dma_active_len > remaining) ? (dma_active_len - remaining) : 0;
+  for (uint32_t i = dma_processed_in_buf; i < sent_in_buf; ++i) {
+    process_step_command(command_buffer[i]);
+  }
+  dma_processed_in_buf = sent_in_buf;
+}
 
 // DMA completion handler
 void __isr dma_complete_handler() {
   if (dma_channel_get_irq0_status(dma_channel)) {
     dma_channel_acknowledge_irq0(dma_channel);
     
-    if (g_gen.phase != TrapDDA::DONE) {
+    // Process any remaining commands in the buffer
+    update_realtime_positions_from_dma();
+    
+    // We've finished the current buffer: account for it
+    dma_move_sent_prev   += dma_active_len;
+    dma_processed_in_buf  = 0;
+    dma_active_len        = 0;    // NEW: mark no active burst while we refill
+
+    if (g_gen.phase != TrapS::DONE) {
+      // Fill next buffer
       size_t n = g_gen.fill(command_buffer, BUFFER_SIZE);
       if (n > 0) {
+        dma_active_len = n;
         dma_channel_set_read_addr(dma_channel, command_buffer, false);
         dma_channel_set_trans_count(dma_channel, n, true);
       } else {
@@ -287,6 +501,7 @@ void __isr dma_complete_handler() {
     } else {
       motion_complete = true;
       motion_active = false;
+      move_done_irq_flag = true;   // NEW: signal main loop to print
     }
   }
 }
@@ -318,27 +533,6 @@ void init_dma() {
 }
 
 // Stop motion
-void stop_motion() {
-  if (dma_channel >= 0) {
-    dma_channel_abort(dma_channel);
-  }
-  
-  pio_sm_set_enabled(pio, sm, false);
-  pio_sm_clear_fifos(pio, sm);
-  
-  for(uint i = SET_BASE; i < SET_BASE + SET_COUNT; i++) {
-    gpio_put(i, 0);
-  }
-  
-  motion_active = false;
-  motion_complete = false;
-  
-  if (g_gen.phase == TrapDDA::DONE) {
-    gCurX = g_gen.curX;
-    gCurY = g_gen.curY;
-    gCurZ = g_gen.curZ;
-  }
-}
 
 // Start motion from queue
 void start_next_move() {
@@ -350,15 +544,24 @@ void start_next_move() {
   if (dequeue_move(&next_move)) {
     stop_motion();
     
-    g_gen.init(next_move, gCurX, gCurY, gCurZ);
+    // Initialize generator with current REAL positions
+    g_gen.init(next_move, realtime_X, realtime_Y, realtime_Z);
     
-    if (g_gen.phase == TrapDDA::DONE) {
-      // Zero-length move, try next one
+    if (g_gen.phase == TrapS::DONE) {
       start_next_move();
       return;
     }
     
     size_t num_commands = g_gen.fill(command_buffer, BUFFER_SIZE);
+
+    // Reset per-move DMA accounting
+    dma_move_sent_prev   = 0;
+    dma_active_len       = num_commands;
+    dma_processed_in_buf = 0;
+
+    // Also reset (since we dropped the per-move guard anyway, this keeps logs sane)
+    total_commands_processed = 0;
+    total_commands_generated = num_commands; // optional (used only for prints now)
     
     if (num_commands == 0) {
       start_next_move();
@@ -374,17 +577,24 @@ void start_next_move() {
     pio_sm_restart(pio, sm);
     pio_sm_set_enabled(pio, sm, true);
     
+    // In start_next_move(), after initializing the move:
+    Serial.print("Move requested: X");
+    Serial.print(next_move.sx);
+    Serial.print(" from ");
+    Serial.println(realtime_X);
+
     motion_active = true;
     motion_complete = false;
     dma_channel_start(dma_channel);
     
-    Serial.print("Started move. Queue: ");
-    Serial.println(get_queue_count());
+    Serial.print("Started move with ");
+    Serial.print(num_commands);
+    Serial.println(" commands");
   }
 }
 
 // =============================
-// G-code Parser with Queue Support
+// G-code Parser
 // =============================
 static float lastFeed_steps_s = 2000.0f;
 
@@ -392,11 +602,11 @@ static void handleLine(const String& line) {
   String s = line; s.trim(); s.toUpperCase(); 
   if (!s.length()) return;
 
-  auto clamp = [](int32_t v){ return constrain(v, -24000, 24000); };
+  auto clamp = [](int32_t v){ return constrain(v, 0, 80000); };
 
   if (s.startsWith("G0") || s.startsWith("G1")) {
     int idx; 
-    int32_t tx=gCurX, ty=gCurY, tz=gCurZ; 
+    int32_t tx=realtime_X, ty=realtime_Y, tz=realtime_Z; 
     float f=lastFeed_steps_s;
     
     if ((idx=s.indexOf('X'))>=0) tx = clamp(s.substring(idx+1).toInt());
@@ -411,13 +621,13 @@ static void handleLine(const String& line) {
       m.d_start_us=1500; m.d_cruise_us=600; m.d_end_us=1500;
     } else {
       m.d_cruise_us = (uint32_t)roundf(1e6f / f);
-      m.d_start_us = (uint32_t)roundf(m.d_cruise_us * 2.0f);
+      m.d_start_us = (uint32_t)roundf(m.d_cruise_us * 3.5f); //2.0f
       m.d_end_us   = m.d_start_us;
       lastFeed_steps_s = f;
     }
     
-    m.accel_frac = 0.35f; 
-    m.decel_frac = 0.35f;
+    m.accel_frac = 0.60f; // 0.35
+    m.decel_frac = 0.60f;
     
     if (queue_move(m)) {
       Serial.print("Queued move to X:");
@@ -429,41 +639,12 @@ static void handleLine(const String& line) {
       Serial.print(" | Queue: ");
       Serial.println(get_queue_count());
       
-      // Start motion if not already running
       if (!motion_active) {
         start_next_move();
       }
     } else {
       Serial.println("ERROR: Move queue full!");
     }
-    return;
-  }
-
-  if (s.startsWith("M114")) {
-    Serial.print("POS: X:");
-    Serial.print(gCurX);
-    Serial.print(" Y:");
-    Serial.print(gCurY);
-    Serial.print(" Z:");
-    Serial.print(gCurZ);
-    Serial.print(" | Moving: ");
-    Serial.print(motion_active ? "YES" : "NO");
-    Serial.print(" | Queue: ");
-    Serial.println(get_queue_count());
-    return;
-  }
-
-  if (s.startsWith("M0") || s.startsWith("M1")) {
-    stop_motion();
-    clear_queue();
-    Serial.println("Stopped motion and cleared queue");
-    return;
-  }
-
-  if (s.startsWith("M2")) {
-    // Stop motion but keep queue
-    stop_motion();
-    Serial.println("Stopped motion (queue preserved)");
     return;
   }
 
@@ -484,15 +665,54 @@ static void handleLine(const String& line) {
     return;
   }
 
+  if (s.startsWith("G92")) {
+    // Set current position using REAL-TIME positions
+    int idx;
+    if ((idx=s.indexOf('X'))>=0) realtime_X = s.substring(idx+1).toInt();
+    if ((idx=s.indexOf('Y'))>=0) realtime_Y = s.substring(idx+1).toInt();
+    if ((idx=s.indexOf('Z'))>=0) realtime_Z = s.substring(idx+1).toInt();
+    
+    Serial.print("Position set to X:");
+    Serial.print(realtime_X);
+    Serial.print(" Y:");
+    Serial.print(realtime_Y);
+    Serial.print(" Z:");
+    Serial.println(realtime_Z);
+    return;
+  }
+
+  if (s.startsWith("M114")) {
+    int32_t x,y,z; read_positions_atomic(x,y,z);
+    Serial.print("POS: X:"); Serial.print(x);
+    Serial.print(" Y:"); Serial.print(y);
+    Serial.print(" Z:"); Serial.print(z);
+    Serial.print(" | Moving: ");
+    Serial.print(motion_active ? "YES" : "NO");
+    Serial.print(" | Queue: ");
+    Serial.println(get_queue_count());
+    return;
+  }
+
+  if (s.startsWith("M0")) {
+    stop_motion();
+    clear_queue();
+    Serial.println("Stopped motion and cleared queue");
+    return;
+  }
+
+  if (s.startsWith("M2")) {
+    stop_motion();
+    Serial.println("Stopped motion (queue preserved)");
+    return;
+  }
+
   if (s.startsWith("M110")) {
-    // Clear queue command
     clear_queue();
     Serial.println("Queue cleared");
     return;
   }
 
   if (s.startsWith("M111")) {
-    // Queue status
     Serial.print("Queue: ");
     Serial.print(get_queue_count());
     Serial.print("/");
@@ -500,31 +720,39 @@ static void handleLine(const String& line) {
     Serial.println(" moves");
     return;
   }
+
+  if (s.startsWith("M120")) {
+    enable_homing_sensors();
+    return;
+  }
+
+  if (s.startsWith("M121")) {
+    disable_homing_sensors();
+    return;
+  }
 }
 
 // =============================
-// Real-time Display
+// TRUE REAL-TIME DISPLAY
 // =============================
 void update_realtime_display() {
   static uint32_t last_display = 0;
   static String previous_line = "";
   
-  if (millis() - last_display < 100) return;
+  if (millis() - last_display < 200) return; // 30Hz updates
   last_display = millis();
   
-  String current_line = "POS: " + String(g_gen.curX) + ", " + 
-                       String(g_gen.curY) + ", " + 
-                       String(g_gen.curZ) + 
+  // Update positions from DMA progress BEFORE displaying
+  update_realtime_positions_from_dma();
+  
+  int32_t x,y,z; read_positions_atomic(x,y,z);
+  String current_line = "POS: " + String(x) + ", " + String(y) + ", " + String(z)+ 
                        (motion_active ? " [MOVING]" : " [IDLE]") +
-                       " Q:" + String(get_queue_count());
+                       " Q:" + String(get_queue_count()) +
+                       " H:" + (homing_enabled ? "ON" : "OFF");
   
-  Serial.print('\n');
-  Serial.print(current_line);
-  
-  if (current_line.length() < previous_line.length()) {
-    for (int i = current_line.length(); i < previous_line.length(); i++) {
-      Serial.print(' ');
-    }
+  if (previous_line != current_line) {
+    Serial.println(current_line);
   }
   
   Serial.flush();
@@ -537,43 +765,55 @@ void update_realtime_display() {
 void setup() {
   Serial.begin(115200);
   delay(2000);
-  Serial.println("Pico Stepper Controller - With Move Queue");
+  Serial.println("Pico Stepper Controller - TRUE Real-time DMA Position Tracking");
   
   pio_stepper_init();
   init_dma();
+  setup_homing_sensors();
   
-  Serial.println("System ready. Commands:");
+  // Initialize real-time positions
+  realtime_X = 0;
+  realtime_Y = 0;
+  realtime_Z = 0;
+  
+  Serial.println("System ready. TRUE real-time DMA position tracking active!");
+  Serial.println("Commands:");
   Serial.println("G0/G1 X.. Y.. Z.. F..  - Queue move");
+  Serial.println("G28                     - Home to origin");
+  Serial.println("G92 X.. Y.. Z..         - Set current position");
   Serial.println("M114                    - Report position/queue");
   Serial.println("M0                      - Stop and clear queue");
   Serial.println("M2                      - Stop (keep queue)");
   Serial.println("M110                    - Clear queue");
   Serial.println("M111                    - Queue status");
-  Serial.println("G28                     - Home to origin");
+  Serial.println("M120                    - Enable homing sensors");
+  Serial.println("M121                    - Disable homing sensors");
   Serial.println();
 }
 
 void loop() {
   static String buf;
 
+  // Check for homing sensor triggers
+  check_homing_safety();
+  
   // Handle motion completion
   if (motion_complete) {
     motion_complete = false;
     
-    // Update global positions
-    gCurX = g_gen.curX;
-    gCurY = g_gen.curY;
-    gCurZ = g_gen.curZ;
+    // Final position update
+    update_realtime_positions_from_dma();
     
-    Serial.println();
-    Serial.print("Move completed. Starting next... Queue: ");
-    Serial.println(get_queue_count());
-    
-    // Start next move in queue
+    if (move_done_irq_flag) {
+      move_done_irq_flag = false;
+      Serial.print("Move completed. Total steps generated: ");
+      Serial.println(g_gen.total_steps_generated);
+    }
+
     start_next_move();
   }
 
-  // Update real-time display
+  // TRUE REAL-TIME display - queries DMA hardware register directly
   update_realtime_display();
   
   // Handle serial commands
@@ -581,7 +821,7 @@ void loop() {
     char c = (char)Serial.read();
     if (c == '\n' || c == '\r') {
       if (buf.length() > 0) {
-        Serial.println(); // New line for command output
+        Serial.println();
         handleLine(buf);
         buf = "";
       }
