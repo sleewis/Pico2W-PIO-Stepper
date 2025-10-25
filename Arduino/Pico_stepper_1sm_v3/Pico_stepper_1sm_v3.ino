@@ -93,6 +93,12 @@ static volatile uint32_t dma_move_sent_prev = 0;     // words fully sent in prev
 static volatile uint32_t dma_active_len     = 0;     // words in the currently active DMA transfer
 static volatile uint32_t dma_processed_in_buf = 0;   // words we've already parsed in the current buffer
 
+// ---- Look-ahead blending knobs ----
+static const float A_MAX_STEPS_S2   = 15000.0f;  // max accel (steps/s^2)
+static const float BLEND_LEN_STEPS  = 50.0f;     // lengte van blend rond hoek (in stappen)
+static const float MIN_CORNER_SPEED = 0.0f;      // bodemhoek-snelheid (steps/s)
+static const float MAX_FEED_STEPS_S = 12000.0f;  // globale begrenzer (optioneel)
+
 // Helper
 static inline void read_positions_atomic(int32_t& x, int32_t& y, int32_t& z) {
   noInterrupts();
@@ -154,6 +160,33 @@ void process_step_command(uint32_t command) {
 #include <math.h>
 #include <algorithm>
 using std::max;
+
+static inline float clampf(float v, float lo, float hi) {
+  return v < lo ? lo : (v > hi ? hi : v);
+}
+
+// hoek: 0..pi uit twee 3D vectoren (dx,dy,dz) en (ux,uy,uz)
+static inline float angle_between_vec(float ax, float ay, float az,
+                                      float bx, float by, float bz) {
+  float la = sqrtf(ax*ax + ay*ay + az*az);
+  float lb = sqrtf(bx*bx + by*by + bz*bz);
+  if (la < 1e-6f || lb < 1e-6f) return 0.0f;
+  float dot = (ax*bx + ay*by + az*bz) / (la*lb);
+  dot = clampf(dot, -1.0f, 1.0f);
+  return acosf(dot);
+}
+
+// conservatieve hoeklimiet: v_corner <= sqrt( Amax * L / (2 sin(theta/2)) )
+static inline float corner_speed_limit(float theta, float a_max, float blend_len_steps) {
+  float s = sinf(0.5f * theta);
+  if (s < 1e-6f) return 1e9f; // rechtuit -> praktisch onbegrensd
+  return sqrtf((a_max * blend_len_steps) / (2.0f * s));
+}
+
+static inline uint32_t period_us_from_speed(float v_steps_s) {
+  v_steps_s = (v_steps_s < 1.0f) ? 1.0f : v_steps_s;
+  return (uint32_t)lrintf(1e6f / v_steps_s);
+}
 
 struct TrapS {
   uint32_t Nx, Ny, Nz;
@@ -321,12 +354,63 @@ bool is_queue_full() {
   return queueCount >= MOVE_QUEUE_SIZE;
 }
 
-bool queue_move(const LineMove& move) {
-  if (is_queue_full()) {
-    return false;
+bool queue_move(const LineMove& move_in) {
+  if (is_queue_full()) return false;
+
+  // Werk met kopie die we eventueel updaten
+  LineMove m = move_in;
+
+  // Als er al een vorige move is, blend de hoek
+  if (queueCount > 0) {
+    // index van vorige (laatst gequeued) entry
+    uint8_t idx_prev  = (uint8_t)((queueTail + MOVE_QUEUE_SIZE - 1) % MOVE_QUEUE_SIZE);
+    LineMove &prev    = moveQueue[idx_prev];
+
+    // Startpunt van 'prev' is óf het target van de move daarvoor, óf de realtime positie
+    int32_t sx0, sy0, sz0;
+    if (queueCount >= 2) {
+      uint8_t idx_prev2 = (uint8_t)((queueTail + MOVE_QUEUE_SIZE - 2) % MOVE_QUEUE_SIZE);
+      sx0 = moveQueue[idx_prev2].sx;
+      sy0 = moveQueue[idx_prev2].sy;
+      sz0 = moveQueue[idx_prev2].sz;
+    } else {
+      sx0 = realtime_X; sy0 = realtime_Y; sz0 = realtime_Z;
+    }
+
+    // Hoekvectoren
+    float pvx = (float)(prev.sx - sx0);
+    float pvy = (float)(prev.sy - sy0);
+    float pvz = (float)(prev.sz - sz0);
+
+    float nvx = (float)(m.sx - prev.sx);
+    float nvy = (float)(m.sy - prev.sy);
+    float nvz = (float)(m.sz - prev.sz);
+
+    float theta = angle_between_vec(pvx, pvy, pvz, nvx, nvy, nvz);
+
+    // Cruise snelheden (begrensd door MAX_FEED_STEPS_S)
+    float v_prev_cruise = fminf(MAX_FEED_STEPS_S, 1e6f / (float)prev.d_cruise_us);
+    float v_new_cruise  = fminf(MAX_FEED_STEPS_S, 1e6f / (float)m.d_cruise_us);
+
+    // Hoeksnelheid, begrensd door beide cruises en ondergrens
+    float v_corner = corner_speed_limit(theta, A_MAX_STEPS_S2, BLEND_LEN_STEPS);
+    v_corner = fminf(v_corner, v_prev_cruise);
+    v_corner = fminf(v_corner, v_new_cruise);
+    v_corner = fmaxf(v_corner, MIN_CORNER_SPEED);
+
+    uint32_t d_corner_us = period_us_from_speed(v_corner);
+
+    // Zet eind-/startperiode op de hoek-snelheid
+    prev.d_end_us = d_corner_us;
+    m.d_start_us  = d_corner_us;
+
+    // Schrijf 'prev' terug (ref al geüpdatet)
+    moveQueue[idx_prev] = prev;
   }
-  
-  moveQueue[queueTail] = move;
+  // else: eerste in de queue -> m.d_start_us laten zoals opgegeven
+
+  // Queue de (mogelijk bijgewerkte) move
+  moveQueue[queueTail] = m;
   queueTail = (queueTail + 1) % MOVE_QUEUE_SIZE;
   queueCount++;
   return true;
@@ -636,10 +720,10 @@ void start_next_move() {
     
     dma_channel_acknowledge_irq0(dma_channel);
     
-    pio_sm_clear_fifos(pio, sm);
-    pio_sm_restart(pio, sm);
-    pio_sm_set_enabled(pio, sm, true);
-    
+    //pio_sm_clear_fifos(pio, sm);
+    //pio_sm_restart(pio, sm);
+    pio_sm_set_enabled(pio, sm, true);  // SM aanzetten is genoeg (na E-stop staat 'ie uit)
+
     // In start_next_move(), after initializing the move:
     Serial.print("Move requested: X");
     Serial.print(next_move.sx);
