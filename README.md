@@ -133,7 +133,7 @@ Below are the main knobs exposed in the sketch and how they affect motion.
   * Use `MAX_FEED_STEPS_S` as a global limiter to keep everything within driver limits.
 
 * **S-curve shaping**
-  Timing per phase is derived from a quintic smoothstep (`6t^5−15t^4+10t^3`). If you want sharper ramps, replace the easing function.
+  Timing per phase is derived from a quintic smoothstep (6t<sup>5</sup> &minus; 15t<sup>4</sup> + 10t<sup>3</sup>). If you want sharper ramps, replace the easing function.
 
 ### Pins & Polarity
 
@@ -184,10 +184,12 @@ Apply per axis when parsing `G0/G1`.
 
 ## Look-Ahead Blending (what you get)
 
-When you queue consecutive segments, the sketch computes a **corner angle** and picks a **corner speed**:
-[
-v_{corner} \le \min!\Big(v_{cruise,prev}, v_{cruise,new}, \sqrt{\tfrac{A_{max}\cdot L_{blend}}{2\sin(\theta/2)}}\Big)
-]
+v<sub>corner</sub> &le; min(
+  v<sub>cruise,prev</sub>,
+  v<sub>cruise,new</sub>,
+  &radic;((A<sub>max</sub> &middot; L<sub>blend</sub>)/(2 &middot; sin(&theta;/2)))
+)
+
 Then it sets:
 `prev.d_end_us = new.d_start_us = 1e6 / v_corner`
 This smooths the velocity through the junction and removes micro-stops. You can tune corner behavior by adjusting the four blending knobs above.
