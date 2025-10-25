@@ -1,6 +1,3 @@
-Here’s a clean, repo-ready **README.md** you can drop in, Sjoerd Leewis.
-
----
 
 # Pico DMA/PIO Stepper Controller (with Real-Time Position Tracking)
 
