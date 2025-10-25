@@ -1,209 +1,197 @@
-Pico Stepper Controller with Move Queue
-A high-performance stepper motor controller for Raspberry Pi Pico 2W (RP2350) using PIO and DMA for smooth, non-blocking motion control with G-code support.
+Here’s a clean, repo-ready **README.md** you can drop in, Sjoerd Leewis.
 
-Features
-🔄 Multi-Axis Control: Simultaneous control of 3 stepper motors (X, Y, Z)
+---
 
-⚡ Hardware Acceleration: Uses RP2350's PIO (Programmable I/O) for precise step timing
+# Pico DMA/PIO Stepper Controller (with Real-Time Position Tracking)
 
-🚀 DMA-Driven: Direct Memory Access for zero-CPU-overhead step generation
+Small, focused Arduino sketch for **Raspberry Pi Pico 2 W (RP2350)** that drives **three stepper axes** using **PIO + DMA**, with a trapezoid/S-curve motion profile and **true real-time position tracking** derived from the DMA transfer counter.
 
-📋 Move Queue: Queue multiple moves for continuous, non-blocking motion
+This project is meant as a **building block** for your own CNC/robotics work: copy, trim, or extend as needed.
 
-🎛️ G-code Support: Standard G-code commands for easy integration
+## Highlights
 
-📈 Advanced Motion: Quadratic acceleration/deceleration profiles for smooth motion
+* **3 axes** (X/Y/Z) with **DIR** (GPIO 0–2) and **STEP** (GPIO 3–5)
+* **PIO pulse engine**: fixed STEP high time (20 µs), per-event extra delay in µs
+* **DMA streaming** of 32-bit “motion words” into the PIO TX FIFO
+* **Real-time position** from DMA transfer count (no guessing, no per-step ISR)
+* **Trapezoid / smooth S-curve** timing (quintic smoothstep) along the **master axis** + Bresenham DDA for followers
+* Tiny **G-code subset** over Serial: `G0`, `G1`, `G28`, `G92`, `M114`, `M0`, `M2`, `M110`, `M111`, `M120`, `M121`
+* **RP2350-safe DMA abort** (handles errata): clears channel EN bit before `abort()` to avoid retriggers
+* Queue of moves with simple start/stop semantics
 
-📊 Real-time Monitoring: Live position display with queue status
+> Also works on RP2040 with minor caveats (see *Notes*).
 
-Hardware Requirements
-Board: Raspberry Pi Pico 2W (RP2350)
+---
 
-IDE: Arduino IDE with Earle Philhower core
+## Hardware & Pinout
 
-Stepper Drivers: Any step/direction drivers (DRV8825, TMC2209, A4988, etc.)
+* Board: **Raspberry Pi Pico 2 W (RP2350)**
+* Logic level: **3.3 V** (most stepper drivers accept 3.3 V logic)
+* Pins:
 
-Power: Appropriate power supply for your stepper motors
+  * **DIR**: X=GPIO **0**, Y=GPIO **1**, Z=GPIO **2**
+  * **STEP**: X=GPIO **3**, Y=GPIO **4**, Z=GPIO **5**
+  * Optional **Enable** pin: wire to your driver if needed (set LOW to enable)
+  * Optional **homing sensors**: `HOME_X_PIN = 20`, `HOME_Y_PIN = 21` (pull-ups enabled)
 
-Pin Connections
+> Ensure your driver’s **DIR setup time** is ≥ 5–10 µs before the first STEP of a block. The sketch handles this at the command level.
 
-GPIO	Function	Stepper Driver
+---
 
-0	X-DIR	DIR pin
+## How it works (in one minute)
 
-1	Y-DIR	DIR pin
+1. The planner builds per-step **32-bit motion words**:
 
-2	Z-DIR	DIR pin
+   ```
+   [bit 0..2]  DIR mask (X,Y,Z)
+   [bit 3..5]  STEP mask (X,Y,Z)
+   [bit 6..31] extra delay (µs) after a fixed 20 µs high
+   ```
+2. A **PIO program** drives the STEP pins high for 20 µs, then waits the “extra delay”, and repeats.
+3. **DMA** streams the motion words to the PIO TX FIFO.
+4. The sketch computes **real-time positions** by comparing `transfer_count` with the active buffer and parsing only the words that have actually left DMA → PIO. This gives **exact X/Y/Z** without interrupts per step.
 
-3	X-STEP	STEP pin
+---
 
-4	Y-STEP	STEP pin
+## Build & Flash
 
-5	Z-STEP	STEP pin
+1. Install the **Earle Philhower** “Arduino-Pico” core.
+2. In Arduino IDE:
 
-Note: Connect stepper driver ENABLE pins as needed for your setup.
+   * **Board**: *Raspberry Pi Pico 2 W*
+   * USB upload as usual.
+3. Files in the repo:
 
-Installation
-Install Arduino Core: Use the Earle Philhower Pico Arduino core
+   * `Pico2W_Simple_Stepper3.ino` (main sketch; your file name may differ)
+   * `stepper_1sm.pio` (the PIO program; compiled automatically to a header)
 
-Add PIO Program: Ensure stepper_1sm.pio.h is in your project directory
+Open Serial Monitor at **115200** baud.
 
-Upload Code: Compile and upload the sketch to your Pico 2W
+---
 
-Connect Serial: Open Serial Monitor at 115200 baud
+## Quick Start
 
-G-code Commands
+Send a few G-code lines over Serial:
 
-Motion Commands
+```
+G1 X2000 Y1000 Z0 F2500
+M114
+G0 X0 Y0 Z0
+G92 X0 Y0 Z0
+```
 
-G0 X.. Y.. Z.. - Rapid move (queued)
+* `G1` uses **F** as steps/second (along the master axis).
+* `G0` runs with the “rapid” delays defined in the sketch.
+* `M114` prints the **live** position from DMA progress.
 
-G1 X.. Y.. Z.. F.. - Controlled move with feedrate (queued)
+Homing (simple demo):
 
-G28 - Home to origin (0,0,0)
+```
+M120   ; enable homing sensors (GPIO 20, 21, active-low)
+G28    ; move to origin (0,0,0)
+M121   ; disable homing sensors
+```
 
-Control Commands
+Stops:
 
-M0 - Stop motion and clear queue
+```
+M2     ; force stop (queue preserved)
+M0     ; force stop + clear queue
+```
 
-M2 - Stop motion (preserve queue)
+---
 
-M110 - Clear move queue
+## Tuning (where to tweak)
 
-M111 - Show queue status
+In the sketch:
 
-M114 - Report current position
+* **Profile timing**
 
-Examples
+  * `d_start_us`, `d_cruise_us`, `d_end_us` — start/cruise/end period (µs)
+  * `accel_frac`, `decel_frac` — fraction of the master-axis steps for accel/decel
+  * S-curve shape uses a smooth quintic (`smoothstep5`); edit if you want a different profile
+* **Queue / buffer**
 
-gcode
+  * `BUFFER_SIZE` (default 512) controls how often we refill DMA (more frequent = finer “real-time” granularity)
+* **Pins**
 
-G1 X1000 Y500 Z0 F800    ; Move to (1000,500,0) at 800 steps/sec
+  * `DIR_INV_MASK` to flip DIR polarity per axis if a motor runs the wrong way
 
-G1 X0 Y0 Z0 F1000        ; Return to origin
+---
 
-M114                     ; Check position
+## Safety & Stopping
 
+There are **two** stop paths in the code:
 
-Key Features
+* **Soft stop** (`stop_motion_soft`)
+  Let the current DMA burst and PIO FIFO **finish naturally** (no abort). Use when you just want to wait until idle before the next move.
 
-Move Queue System
+* **Force stop** (`stop_motion_force`)
+  For **E-stop / mid-move cancel**. On RP2350 we:
 
-32-move queue capacity
+  1. **disable IRQ** for the channel and clear pending
+  2. **clear the DMA EN bit** in `CTRL_TRIG` (errata workaround)
+  3. call `dma_channel_abort()`
+  4. clear spurious “done” IRQ if any
+  5. reset the **PIO** SM and FIFOs
 
-Automatic sequencing - moves execute continuously
+`M0` and `M2` use the **force stop**. `start_next_move()` **does not abort**; it starts the next move only when idle (recommended).
 
-Non-blocking - send commands while motors are moving
+---
 
-Queue management - stop, clear, or check status anytime
+## Real-Time Position (what “TRUE” means here)
 
-Advanced Motion Control
+* The sketch advances X/Y/Z **only** for motion words that have actually **left the DMA channel** (i.e., were pushed to PIO).
+* On buffer completion (DMA IRQ), it processes any **remaining** words from the active buffer.
+* Asking for `M114` or the periodic status first calls `update_realtime_positions_from_dma()` to catch up to hardware.
+* This produces **deterministic positions** even at high step rates, without software jitter.
 
-Quadratic easing for smooth acceleration/deceleration
+---
 
-Trapezoidal velocity profiles with configurable curves
+## Notes & Limits
 
-Bresenham DDA algorithm for multi-axis interpolation
+* **RP2350 vs RP2040**
+  The force-stop path includes a register-level EN-bit clear before `abort()` to avoid retriggering on RP2350. On RP2040 you may see a “late” completion IRQ after abort; the sketch already acks/guards for that.
 
-Configurable acceleration (35% by default)
+* **Timing**
+  The PIO SM is configured at **1 MHz** (1 tick = 1 µs). The STEP high is fixed at **20 µs**; “extra delay” encodes the rest of the inter-step period.
 
-Hardware Optimization
+* **Units**
+  All positions are **steps** (absolute). Feed `F` is **steps/s**.
 
-PIO state machine handles precise step timing
+* **Homing**
+  The homing demo is minimal—adapt to your switches/logic and add homing sequences as needed.
 
-DMA transfers free CPU for other tasks
+* **Drivers**
+  Most A4988/DRV/TMC drivers accept 3.3 V logic. If your driver has **EN**, pull it to the correct level to enable outputs.
 
-Real-time position tracking during motion
+---
 
-Efficient buffer management with interrupt-driven refills
+## Project Structure
 
-Performance
+```
+/ (repo root)
+├── Pico2W_Simple_Stepper3.ino    # main sketch (name may differ)
+├── stepper_1sm.pio               # PIO program (compiled to .h by the core)
+└── README.md
+```
 
-Step Rate: Up to 50,000+ steps/second
+---
 
-Pulse Width: Fixed 20μs step pulses in PIO
+## License
 
-Timing Resolution: 1μs precision
+MIT. See `LICENSE` (add your preferred license here).
 
-Update Rate: 100ms position display updates
+---
 
-Configuration
+## Credits
 
-Tuning Motion Parameters
+* Created by **Sjoerd Leewis**.
+* Built for the Earle Philhower Arduino-Pico core.
+* Thanks to the Raspberry Pi silicon docs and community examples around PIO + DMA streaming.
 
-Adjust in the handleLine function:
+---
 
-cpp
+### Got ideas?
 
-m.accel_frac = 0.35f;   // Acceleration distance (35% of move)
-
-m.decel_frac = 0.35f;   // Deceleration distance (35% of move)
-
-m.d_start_us = 2000;    // Start delay (slower acceleration)
-
-m.d_cruise_us = 1000;   // Cruise speed delay
-
-Direction Inversion
-
-If motors move backwards:
-
-cpp
-
-#define DIR_INV_MASK (1u<<0)  // Invert X axis
-
-#define DIR_INV_MASK (1u<<1)  // Invert Y axis  
-
-#define DIR_INV_MASK (1u<<2)  // Invert Z axis
-
-Project Structure
-
-text
-
-pico-stepper-controller/
-
-├── Pico_stepper_1sm_v2.ino    # Main Arduino sketch
-
-├── stepper_1sm.pio.h          # PIO assembly program
-
-└── README.md                  # This file
-
-
-Applications
-
-Robotics & Automation
-
-Precision positioning systems
-
-Custom motion control projects
-
-Troubleshooting
-
-Motors not moving?
-
-Check driver power and enable pins
-
-Verify DIR/STEP connections
-
-Check serial baud rate (115200)
-
-Jerk motion?
-
-Increase acceleration fractions (0.4-0.6)
-
-Adjust start/end delays
-
-Queue full?
-
-Increase MOVE_QUEUE_SIZE in code
-
-Send M110 to clear queue
-
-License
-
-Open source - feel free to modify for your projects!
-
-Contributing
-
-Contributions welcome! Please feel free to submit pull requests or open issues for bugs and feature requests.
-
-Happy Making! 🛠️ If this project helps you, please give it a ⭐ on GitHub!
+PRs and issues are welcome—especially improvements to the planner (arc support, look-ahead blending, jerk-limits per axis) or extra G-code commands.
