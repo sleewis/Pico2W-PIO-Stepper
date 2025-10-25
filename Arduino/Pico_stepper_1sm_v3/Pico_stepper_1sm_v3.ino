@@ -6,6 +6,8 @@ extern "C" {
   #include "hardware/pio.h"
   #include "hardware/clocks.h"
   #include "hardware/dma.h"
+  #include "hardware/regs/dma.h"      // DMA_CH0_CTRL_TRIG_EN_BITS
+  #include "hardware/structs/dma.h"   // dma_hw
   #include "hardware/irq.h"
 }
 
@@ -375,19 +377,80 @@ static volatile bool motion_complete = false;
 static TrapS g_gen;
 
 void emergency_stop() {
-  if (dma_channel >= 0) dma_channel_abort(dma_channel);
-  pio_sm_set_enabled(pio, sm, false);
-  pio_sm_clear_fifos(pio, sm);
+  stop_motion_force();
   clear_queue();
-  motion_active = false;
-  motion_complete = false;
+  Serial.println("EMERGENCY STOP executed.");
 }
 
-void stop_motion() {
-  if (dma_channel >= 0) dma_channel_abort(dma_channel);
+// Soft: netjes uit laten lopen (geen abort, SM blijft aan)
+// Gebruik dit NIET middenin een actieve move; bedoeld voor "wachten tot idle"
+void stop_motion_soft() {
+  if (dma_channel < 0) return;
+
+  // Wacht tot de lopende burst klaar is
+  while (dma_channel_is_busy(dma_channel)) {
+    update_realtime_positions_from_dma();   // realtime tellen wat al verstuurd is
+    tight_loop_contents();
+  }
+  // Verwerk rest uit huidige buffer
+  update_realtime_positions_from_dma();
+
+  // Wacht tot de PIO TX FIFO leeg is (zou snel 0 zijn)
+  while (pio_sm_get_tx_fifo_level(pio, sm) != 0) {
+    tight_loop_contents();
+  }
+
+  // Pending IRQ (van de net afgeronde burst) opruimen
+  dma_channel_acknowledge_irq0(dma_channel);
+
+  motion_active   = false;
+  // Laat motion_complete door je IRQ of start_next_move() bepalen
+}
+
+// Force: RP2350-veilige abort middenin een move (E-stop)
+// - IRQ uit
+// - EN-bit clear (E5)
+// - abort
+// - spurious IRQ weg
+// - SM/FIFO reset
+void stop_motion_force() {
+  if (dma_channel < 0) {
+    // PIO naar schone staat
+    pio_sm_set_enabled(pio, sm, false);
+    pio_sm_clear_fifos(pio, sm);
+    pio_sm_restart(pio, sm);
+    motion_active = false;
+    motion_complete = false;
+    return;
+  }
+
+  // Verwerk wat al verstuurd is vóór we hard stoppen
+  update_realtime_positions_from_dma();
+
+  // 1) IRQ tijdelijk uit + pending clear
+  dma_channel_set_irq0_enabled(dma_channel, false);
+  dma_hw->ints0 = (1u << dma_channel);
+
+  // 2) RP2350-E5: EN-bit van het kanaal eerst uit
+  dma_hw->ch[dma_channel].ctrl_trig &= ~DMA_CH0_CTRL_TRIG_EN_BITS;
+  __dmb();  // geheugenbarrière
+
+  // 3) Abort; wacht tot bus/in-flight klaar is
+  dma_channel_abort(dma_channel);
+
+  // 4) Spurious 'done' IRQ (E13/E5) wegklikken
+  dma_hw->ints0 = (1u << dma_channel);
+
+  // 5) PIO in schone staat
   pio_sm_set_enabled(pio, sm, false);
   pio_sm_clear_fifos(pio, sm);
-  motion_active = false;
+  pio_sm_restart(pio, sm);
+  // (optioneel) pinnen hard laag forceren met pio_sm_exec(...)
+
+  // 6) IRQ weer aan voor volgende moves
+  dma_channel_set_irq0_enabled(dma_channel, true);
+
+  motion_active   = false;
   motion_complete = false;
 }
 
@@ -542,7 +605,7 @@ void start_next_move() {
   
   LineMove next_move;
   if (dequeue_move(&next_move)) {
-    stop_motion();
+    // stop_motion();
     
     // Initialize generator with current REAL positions
     g_gen.init(next_move, realtime_X, realtime_Y, realtime_Z);
@@ -667,6 +730,7 @@ static void handleLine(const String& line) {
 
   if (s.startsWith("G92")) {
     // Set current position using REAL-TIME positions
+    stop_motion_soft(); // Optioneel
     int idx;
     if ((idx=s.indexOf('X'))>=0) realtime_X = s.substring(idx+1).toInt();
     if ((idx=s.indexOf('Y'))>=0) realtime_Y = s.substring(idx+1).toInt();
@@ -694,14 +758,14 @@ static void handleLine(const String& line) {
   }
 
   if (s.startsWith("M0")) {
-    stop_motion();
+    stop_motion_force();
     clear_queue();
     Serial.println("Stopped motion and cleared queue");
     return;
   }
 
   if (s.startsWith("M2")) {
-    stop_motion();
+    stop_motion_force();
     Serial.println("Stopped motion (queue preserved)");
     return;
   }
