@@ -7,7 +7,7 @@
 #include "gcode.h"
 
 void setup(){
-  _debug = true; _usb = true;
+  _debug = false; _usb = true;
   Serial.begin();
   uint32_t t0=millis(); while(!Serial && millis()-t0<5000) delay(10);
 
