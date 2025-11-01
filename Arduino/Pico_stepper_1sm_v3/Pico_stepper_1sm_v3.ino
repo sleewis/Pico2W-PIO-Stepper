@@ -58,6 +58,9 @@ void loop(){
 
   while(Serial.available() || Serial1.available()){
     char c;
+    bool usb = Serial.available();
+    if (usb != _usb){ _usb = usb; SD.setOutput(_usb ? static_cast<Stream&>(Serial) : static_cast<Stream&>(Serial1));}
+    
     if (Serial.available()) c=(char)Serial.read(); else c=(char)Serial1.read();
     if(c=='\n'||c=='\r'){
       if(buf.length()>0){ handleLine(buf); buf=""; }
