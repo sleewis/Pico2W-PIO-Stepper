@@ -6,10 +6,8 @@
 #include "homing.h"
 #include "gcode.h"
 
-bool _debug = true;
-bool _usb = true;
-
 void setup(){
+  _debug = true; _usb = true;
   Serial.begin();
   uint32_t t0=millis(); while(!Serial && millis()-t0<5000) delay(10);
 
