@@ -218,12 +218,11 @@ void start_next_move(){
   dma_channel_set_trans_count(dma_channel, n, false);
   dma_channel_acknowledge_irq0(dma_channel);
 
-#if DEBUG
-  Serial.print("Move requested: X"); Serial.print(next_move.sx);
-  Serial.print(" from "); Serial.println(realtime_X);
-  Serial.print("Started move with "); Serial.print(n); Serial.println(" commands");
-#endif
-
+  if (_debug){
+    SD.print("Move requested: X"); SD.print(next_move.sx);
+    SD.print(" from "); SD.println(realtime_X);
+    SD.print("Started move with "); SD.print(n); SD.println(" commands");
+  }
   pio_sm_set_enabled(pio, sm, true);
   motion_active=true; motion_complete=false;
   dma_channel_start(dma_channel);
@@ -237,4 +236,3 @@ void emergency_stop(){
 uint32_t planner_total_steps_generated(){
   return g_gen.total_steps_generated;
 }
-

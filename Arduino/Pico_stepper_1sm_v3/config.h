@@ -2,16 +2,15 @@
 #include <Arduino.h>
 #include "types.h"
 
-// ---- Debug ----
-#ifndef DEBUG
-#define DEBUG 1
-#endif
+extern bool _debug;
+extern bool _usb;
 
-#define BUFFER_SIZE 512u
+#define BUFFER_SIZE 64u //512u
 
 // ---- Pins ----
 constexpr uint HOME_X_PIN = 20;
 constexpr uint HOME_Y_PIN = 21;
+//constexpr uint HOME_Z_PIN = ??;
 
 // ---- PIO/DIR invert mask ----
 #define DIR_INV_MASK (0u) // bv: (1u<<1) om Y te inverteren
@@ -31,9 +30,8 @@ constexpr float BLEND_LEN_STEPS  = 50.0f;
 constexpr float MIN_CORNER_SPEED = 0.0f;
 constexpr float MAX_FEED_STEPS_S = 12000.0f;
 
-
-
 // ---- Per-axis limits (runtime variabelen, gedefinieerd in config.cpp) ----
 extern AxisLimits LIMIT_X;
 extern AxisLimits LIMIT_Y;
 extern AxisLimits LIMIT_Z;
+

@@ -18,14 +18,17 @@ static void homing_isr_cb(uint gpio, uint32_t events){
     homing_enabled=false;
     gpio_set_irq_enabled(HOME_X_PIN, GPIO_IRQ_LEVEL_LOW, false);
     gpio_set_irq_enabled(HOME_Y_PIN, GPIO_IRQ_LEVEL_LOW, false);
+    //gpio_set_irq_enabled(HOME_Z_PIN, GPIO_IRQ_LEVEL_LOW, false);
   }
 }
 
 void setup_homing_sensors(){
   gpio_init(HOME_X_PIN); gpio_set_dir(HOME_X_PIN, GPIO_IN); gpio_pull_up(HOME_X_PIN);
   gpio_init(HOME_Y_PIN); gpio_set_dir(HOME_Y_PIN, GPIO_IN); gpio_pull_up(HOME_Y_PIN);
+  //gpio_init(HOME_Z_PIN); gpio_set_dir(HOME_Z_PIN, GPIO_IN); gpio_pull_up(HOME_Z_PIN);
   gpio_set_irq_enabled_with_callback(HOME_X_PIN, GPIO_IRQ_LEVEL_LOW, false, &homing_isr_cb);
   gpio_set_irq_enabled(HOME_Y_PIN, GPIO_IRQ_LEVEL_LOW, false);
+  //gpio_set_irq_enabled(HOME_Z_PIN, GPIO_IRQ_LEVEL_LOW, false);
   homing_enabled=false;
 }
 
@@ -33,30 +36,28 @@ void enable_homing_sensors(){
   homing_enabled=true;
   gpio_set_irq_enabled(HOME_X_PIN, GPIO_IRQ_LEVEL_LOW, true);
   gpio_set_irq_enabled(HOME_Y_PIN, GPIO_IRQ_LEVEL_LOW, true);
-#if DEBUG
-  Serial.println("Homing sensors ENABLED");
-#endif
+  //gpio_set_irq_enabled(HOME_Z_PIN, GPIO_IRQ_LEVEL_LOW, true);
+  SD.println("Homing sensors ENABLED");
 }
 
 void disable_homing_sensors(){
   homing_enabled=false;
   gpio_set_irq_enabled(HOME_X_PIN, GPIO_IRQ_LEVEL_LOW, false);
   gpio_set_irq_enabled(HOME_Y_PIN, GPIO_IRQ_LEVEL_LOW, false);
-#if DEBUG
-  Serial.println("Homing sensors DISABLED");
-#endif
+  //gpio_set_irq_enabled(HOME_Z_PIN, GPIO_IRQ_LEVEL_LOW, false);
+  SD.println("Homing sensors DISABLED");
 }
 
 void check_homing_safety(){
   if(homing_triggered){
     homing_triggered=false;
-#if DEBUG
-    Serial.println("\n!!! EMERGENCY STOP - Homing Sensor Triggered !!!");
-    Serial.print("Sensor on GPIO: "); Serial.println(triggered_sensor);
-    Serial.print("Stopped at X:"); Serial.print(realtime_X);
-    Serial.print(" Y:"); Serial.print(realtime_Y);
-    Serial.print(" Z:"); Serial.println(realtime_Z);
-    Serial.println("All motion stopped and queue cleared");
-#endif
+    if (_debug){
+      SD.println("\n!!! EMERGENCY STOP - Homing Sensor Triggered !!!");
+      SD.print("Sensor on GPIO: "); SD.println(triggered_sensor);
+      SD.print("Stopped at X:"); SD.print(realtime_X);
+      SD.print(" Y:"); SD.print(realtime_Y);
+      SD.print(" Z:"); SD.println(realtime_Z);
+      SD.println("All motion stopped and queue cleared");
+    }
   }
 }

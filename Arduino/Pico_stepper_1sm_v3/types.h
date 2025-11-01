@@ -1,5 +1,6 @@
 #pragma once
 #include <Arduino.h>
+#include "SerialDevice.h"
 
 enum Axis { AXIS_X=0, AXIS_Y=1, AXIS_Z=2 };
 
@@ -19,5 +20,4 @@ struct AxisLimits {
   UnitLimit steps;  // voor UNITS_STEPS
   UnitLimit mm;     // voor UNITS_MM
   UnitLimit deg;    // voor UNITS_DEG
-  bool wrap_deg_360; // optioneel: 0..360 normaliseren vóór clamp
 };
