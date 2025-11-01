@@ -31,22 +31,6 @@ void handleLine(const String& line){
     return;
   }
 
-  if(s.startsWith("UART")){
-    SD.println("Setting output to serial device UART0 TX(16) RX(17) 115200 baud");
-    if (Serial1){
-      SD.setOutput(static_cast<Stream&>(Serial1));
-      SD.println("Hi there UART, type HELP if you need any ");
-    } else SD.println("UART0 not ready, using TX(16) RX(17) 115200 baud");
-    return;
-  }
-
-  if(s.startsWith("USB")){
-    SD.println("Setting output to USB Serial device");
-    SD.setOutput(static_cast<Stream&>(Serial));
-    SD.println("Hi there USB, type HELP if you need any ");
-    return;
-  }
-
   if(s.startsWith("G101")||s.startsWith("G102")||s.startsWith("G103")){
     if(s.startsWith("G101")) g_units=UNITS_STEPS;
     if(s.startsWith("G102")) g_units=UNITS_MM;
@@ -209,3 +193,4 @@ void update_realtime_display(){
   }
   prev=line;
 }
+
