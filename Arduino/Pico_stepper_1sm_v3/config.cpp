@@ -18,4 +18,7 @@ AxisLimits LIMIT_Z = {
   /*deg  */ { false, 0.0f, 0.0f }
 };
 
+bool _debug = true;
+bool _usb = true;
+
 SerialDevice SD(Serial);
