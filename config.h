@@ -1,5 +1,6 @@
 #pragma once
 #include <Arduino.h>
+#include "bootBanner.h"
 #include "types.h"
 
 extern bool _debug;

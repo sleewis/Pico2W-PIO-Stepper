@@ -28,12 +28,8 @@ void setup(){
 
   realtime_X=realtime_Y=realtime_Z=0;
 
-  if (_debug) {
-    SD.println("System ready. Commands:");
-    SD.println("W... ... | C2 (GS232 commands)");
-    SD.println("G0/G1 X.. Y.. Z.. F..  | G28 | G92 X.. Y.. Z.. | M114 | M0|M2|M110|M111 | M120|M121");
-    SD.println("G101 steps | G102 mm | G103 deg");
-  }
+  // Kleur aan (true) of zonder kleur (false)
+  bootBanner::print_boot_banner(true, "v0.3.0");
 }
 
 void loop(){

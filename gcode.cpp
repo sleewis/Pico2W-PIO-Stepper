@@ -31,6 +31,12 @@ void handleLine(const String& line){
     return;
   }
 
+    if(s.startsWith("HELP")){
+      // Kleur aan (true) of zonder kleur (false)
+      bootBanner::print_boot_banner(true, "v0.3.0");
+    return;
+  }
+
   if(s.startsWith("G101")||s.startsWith("G102")||s.startsWith("G103")){
     if(s.startsWith("G101")) g_units=UNITS_STEPS;
     if(s.startsWith("G102")) g_units=UNITS_MM;
@@ -76,9 +82,18 @@ void handleLine(const String& line){
     float f_steps_s = F_units_s * steps_per_unit_for_master;
 
     LineMove m; m.sx=tx; m.sy=ty; m.sz=tz;
-    if(s.startsWith("G0") || s.startsWith("W")){ m.d_start_us=10'000; m.d_cruise_us=3000; m.d_end_us=10'000; }
-    else { m.d_cruise_us=(uint32_t)roundf(1e6f/f_steps_s); m.d_start_us=(uint32_t)roundf(m.d_cruise_us*3.5f); m.d_end_us=m.d_start_us; lastFeed_units_s=F_units_s; }
-    m.accel_frac=0.60f; m.decel_frac=0.60f;
+    if(s.startsWith("G0") || s.startsWith("W")){
+      m.d_start_us=20'000;
+      m.d_cruise_us=3000;
+      m.d_end_us=20'000;
+    }
+    else {
+      m.d_cruise_us=(uint32_t)roundf(1e6f/f_steps_s);
+      m.d_start_us=(uint32_t)roundf(m.d_cruise_us*3.5f);
+      m.d_end_us=m.d_start_us;
+      lastFeed_units_s=F_units_s;
+    }
+    m.accel_frac=0.30f; m.decel_frac=0.30f;
 
     if(queue_move(m)){
       if (_debug){
@@ -146,7 +161,6 @@ void handleLine(const String& line){
     }
     return;
   }
-
 
   if(s.startsWith("M0")){
     stop_motion_force(); clear_queue();
