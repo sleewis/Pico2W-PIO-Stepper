@@ -187,6 +187,27 @@ void handleLine(const String& line){
   
   if(s.startsWith("M120")){ enable_homing_sensors(); return; }
   if(s.startsWith("M121")){ disable_homing_sensors(); return; }
+
+  // M902 S0|S1|S2
+  if (s.startsWith("M902")) {
+    int si = s.indexOf('S');
+    if (si >= 0) {
+      int val = s.substring(si+1).toInt();
+      MotionProfile p = PROF_S_CURVE;
+      if      (val == 0) p = PROF_TRAPEZOID_PERIOD;
+      else if (val == 1) p = PROF_CONSTACC_SPEED;
+      set_motion_profile(p);
+    }
+    SD.print("Motion profile: ");
+    SD.println(motion_profile_name(get_motion_profile()));
+    return;
+  }
+
+  if (s.startsWith("M903")) {
+    SD.print("Motion profile: ");
+    SD.println(motion_profile_name(get_motion_profile()));
+    return;
+  }
 }
 
 void update_realtime_display(){

@@ -12,6 +12,51 @@ extern "C" {
 #include "config.h"
 #include "state.h"
 #include "queue.h"   // voor clear_queue()
+#include "motion.h"
+
+// ---- planner (S-curve, Bresenham) ----
+struct TrapS {
+  // Geometry / DDA
+  uint32_t Nx, Ny, Nz, Nmax;
+  Axis     master;
+  bool     dx, dy, dz;
+
+  // Trapezoid segmentation
+  uint32_t steps_acc, steps_cruise, steps_decel;
+
+  // Periods (µs) and running state
+  int32_t  d_start, d_cruise, d_end, d_cur;
+  enum Phase { ACCEL, CRUISE, DECEL, DONE } phase;
+  uint32_t i_in_phase;
+
+  // Bresenham accumulators
+  int32_t  ex, ey, ez;
+
+  // Telemetry
+  uint32_t total_steps_generated = 0;
+
+  // --- Added for runtime motion profiles ---
+  // Trapezoid (linear period)
+  int32_t slope_acc = 0;  // Δ(period µs)/step during ACCEL
+  int32_t slope_dec = 0;  // Δ(period µs)/step during DECEL
+
+  // Constant-acceleration in speed space (steps/s)
+  double v_start = 0.0, v_cruise_s = 0.0, v_end_s = 0.0; // boundary speeds
+  double a_acc   = 0.0, a_dec     = 0.0;                 // per-step constant accel
+  double v_cur   = 0.0;                                   // running speed at phase
+
+  // Quintic smoothstep for S-curve
+  static inline float smooth5(float t) {
+    if (t <= 0.0f) return 0.0f;
+    if (t >= 1.0f) return 1.0f;
+    return t*t*t*(10.0f + t*(-15.0f + 6.0f*t));
+  }
+
+  // API
+  void   init(const LineMove& m, int32_t cur_x, int32_t cur_y, int32_t cur_z);
+  size_t fill(uint32_t* out, size_t cap);
+};
+
 
 // --- helpers ---
 static inline float clkdiv_1MHz(){
@@ -60,69 +105,212 @@ void update_realtime_positions_from_dma(){
   dma_processed_in_buf = sent_in_buf;
 }
 
+// Runtime motion-profile (default = CONST-ACC in speed)
+static volatile MotionProfile s_profile = PROF_CONSTACC_SPEED;
+
+void set_motion_profile(MotionProfile p) { s_profile = p; }
+MotionProfile get_motion_profile() { return s_profile; }
+const char* motion_profile_name(MotionProfile p) {
+  switch (p) {
+    case PROF_TRAPEZOID_PERIOD: return "TRAPEZOID (linear period)";
+    case PROF_CONSTACC_SPEED:   return "CONST-ACC (speed)";
+    case PROF_S_CURVE:          return "S-CURVE (quintic)";
+    default: return "UNKNOWN";
+  }
+}
+
+
 // ---- planner (S-curve, Bresenham) ----
-struct TrapS {
-  uint32_t Nx,Ny,Nz,Nmax; Axis master; bool dx,dy,dz;
-  uint32_t steps_acc,steps_cruise,steps_decel;
-  int32_t d_start,d_cruise,d_end,d_cur; enum Phase{ACCEL,CRUISE,DECEL,DONE} phase; uint32_t i_in_phase;
-  int32_t ex,ey,ez; uint32_t total_steps_generated=0;
+void TrapS::init(const LineMove& m, int32_t cur_x, int32_t cur_y, int32_t cur_z) {
+  // Deltas
+  int32_t dxs = m.sx - cur_x;
+  int32_t dys = m.sy - cur_y;
+  int32_t dzs = m.sz - cur_z;
 
-  static inline float smooth5(float t){
-    if(t<=0) return 0; if(t>=1) return 1;
-    return t*t*t*(10.0f + t*(-15.0f + 6.0f*t));
+  Nx = (uint32_t)abs(dxs);
+  Ny = (uint32_t)abs(dys);
+  Nz = (uint32_t)abs(dzs);
+  Nmax = max(Nx, max(Ny, Nz));
+  if (!Nmax) { phase = DONE; return; }
+
+  dx = (dxs >= 0); dy = (dys >= 0); dz = (dzs >= 0);
+  master = (Nmax == Nx) ? AXIS_X : ((Nmax == Ny) ? AXIS_Y : AXIS_Z);
+
+  // Segment fractions
+  steps_acc   = (uint32_t)lrintf(m.accel_frac * Nmax);
+  steps_decel = (uint32_t)lrintf(m.decel_frac * Nmax);
+  if (steps_acc + steps_decel > Nmax) {
+    steps_acc = Nmax/2;
+    steps_decel = Nmax - steps_acc;
   }
+  steps_cruise = Nmax - steps_acc - steps_decel;
 
-  void init(const LineMove& m,int32_t cx,int32_t cy,int32_t cz){
-    int32_t dxs=m.sx-cx, dys=m.sy-cy, dzs=m.sz-cz;
-    Nx=abs(dxs); Ny=abs(dys); Nz=abs(dzs); Nmax = max(Nx, max(Ny,Nz));
-    if(!Nmax){ phase=DONE; return; }
-    dx=(dxs>=0); dy=(dys>=0); dz=(dzs>=0);
-    master = (Nmax==Nx)?AXIS_X:((Nmax==Ny)?AXIS_Y:AXIS_Z);
+  // Periods (µs)
+  d_start  = (int32_t)m.d_start_us;
+  d_cruise = (int32_t)m.d_cruise_us;
+  d_end    = (int32_t)m.d_end_us;
 
-    steps_acc = (uint32_t)roundf(m.accel_frac*Nmax);
-    steps_decel = (uint32_t)roundf(m.decel_frac*Nmax);
-    if(steps_acc+steps_decel > Nmax){ steps_acc=Nmax/2; steps_decel=Nmax-steps_acc; }
-    steps_cruise = Nmax - steps_acc - steps_decel;
+  // Initial phase state
+  phase = steps_acc ? ACCEL : (steps_cruise ? CRUISE : (steps_decel ? DECEL : DONE));
+  i_in_phase = 0;
+  d_cur = d_start;
 
-    d_start=(int32_t)m.d_start_us; d_cruise=(int32_t)m.d_cruise_us; d_end=(int32_t)m.d_end_us;
-    phase = steps_acc?ACCEL:(steps_cruise?CRUISE:(steps_decel?DECEL:DONE));
-    i_in_phase=0; d_cur=d_start; ex=ey=ez=-(int32_t)Nmax/2; total_steps_generated=0;
+  // DDA errors (centered)
+  ex = ey = ez = -(int32_t)Nmax/2;
+
+  total_steps_generated = 0;
+
+  // --- Precompute for profiles ---
+  // Trapezoid in period-space
+  slope_acc = (steps_acc   ? (int32_t)((int64_t)d_cruise - d_start)  / (int32_t)steps_acc   : 0);
+  slope_dec = (steps_decel ? (int32_t)((int64_t)d_end    - d_cruise) / (int32_t)steps_decel : 0);
+
+  // Constant-acc in speed-space (steps/s)
+  v_start   = (d_start  > 0) ? (1e6 / (double)d_start)  : 1e9;
+  v_cruise_s= (d_cruise > 0) ? (1e6 / (double)d_cruise) : v_start;
+  v_end_s   = (d_end    > 0) ? (1e6 / (double)d_end)    : v_cruise_s;
+
+  a_acc = (steps_acc   ? ( (v_cruise_s*v_cruise_s - v_start*v_start) / (2.0 * (double)steps_acc) ) : 0.0);
+  a_dec = (steps_decel ? ( (v_end_s*v_end_s      - v_cruise_s*v_cruise_s) / (2.0 * (double)steps_decel) ) : 0.0);
+
+  switch (phase) {
+    case ACCEL:  v_cur = v_start;     break;
+    case CRUISE: v_cur = v_cruise_s;  break;
+    case DECEL:  v_cur = v_cruise_s;  break;
+    default:     v_cur = v_end_s;     break;
   }
+}
 
-  size_t fill(uint32_t* out, size_t cap){
-    size_t n=0; if(phase==DONE) return 0;
-    while(n<cap && phase!=DONE){
-      bool sxp=false,syp=false,szp=false;
-      switch(master){
-        case AXIS_X: sxp=true; ey+=Ny; if(ey>=0){ey-=Nmax; syp=true;} ez+=Nz; if(ez>=0){ez-=Nmax; szp=true;} break;
-        case AXIS_Y: syp=true; ex+=Nx; if(ex>=0){ex-=Nmax; sxp=true;} ez+=Nz; if(ez>=0){ez-=Nmax; szp=true;} break;
-        case AXIS_Z: szp=true; ex+=Nx; if(ex>=0){ex-=Nmax; sxp=true;} ey+=Ny; if(ey>=0){ey-=Nmax; syp=true;} break;
-      }
-      switch(phase){
-        case ACCEL:{ float t=(steps_acc? (float)i_in_phase/(float)steps_acc : 1.0f);
-                     float s=smooth5(t); d_cur=(int32_t)lrintf((1.0f-s)*d_start + s*d_cruise); } break;
-        case CRUISE: d_cur=d_cruise; break;
-        case DECEL:{ float t=(steps_decel? (float)i_in_phase/(float)steps_decel : 1.0f);
-                     float s=smooth5(t); d_cur=(int32_t)lrintf((1.0f-s)*d_cruise + s*d_end); } break;
-        default: break;
-      }
-      if(d_cur<0) d_cur=0;
-      const uint32_t PULSE_US=20;
-      uint32_t extra = ( (uint32_t)d_cur>PULSE_US ) ? ((uint32_t)d_cur-PULSE_US) : 0u;
-      out[n++] = make_cmd(dx,dy,dz, sxp,syp,szp, extra);
-      total_steps_generated++;
+size_t TrapS::fill(uint32_t* out, size_t cap) {
+  size_t n = 0; 
+  if (phase == DONE) return 0;
 
-      i_in_phase++;
-      switch(phase){
-        case ACCEL:  if(i_in_phase>=steps_acc) { phase=(steps_cruise?CRUISE:(steps_decel?DECEL:DONE)); i_in_phase=0; } break;
-        case CRUISE: if(i_in_phase>=steps_cruise){ phase=(steps_decel?DECEL:DONE); i_in_phase=0; } break;
-        case DECEL:  if(i_in_phase>=steps_decel) { phase=DONE; } break;
-        default: break;
-      }
+  while (n < cap && phase != DONE) {
+    // --- Decide which axes step (Bresenham) ---
+    bool sxp=false, syp=false, szp=false;
+    switch (master) {
+      case AXIS_X:
+        sxp = true;
+        ey += (int32_t)Ny; if (ey >= 0) { ey -= (int32_t)Nmax; if (Ny) syp = true; }
+        ez += (int32_t)Nz; if (ez >= 0) { ez -= (int32_t)Nmax; if (Nz) szp = true; }
+        break;
+      case AXIS_Y:
+        syp = true;
+        ex += (int32_t)Nx; if (ex >= 0) { ex -= (int32_t)Nmax; if (Nx) sxp = true; }
+        ez += (int32_t)Nz; if (ez >= 0) { ez -= (int32_t)Nmax; if (Nz) szp = true; }
+        break;
+      case AXIS_Z:
+        szp = true;
+        ex += (int32_t)Nx; if (ex >= 0) { ex -= (int32_t)Nmax; if (Nx) sxp = true; }
+        ey += (int32_t)Ny; if (ey >= 0) { ey -= (int32_t)Nmax; if (Ny) syp = true; }
+        break;
     }
-    return n;
+
+    // ---- Per-step timing (three profiles) ----
+    auto step_interval_constacc = [](double &v, double a)->double {
+      if (a == 0.0) return (v > 1e-9) ? (1.0 / v) : 0.0;  // cruise
+      double v2_next = v*v + 2.0*a; if (v2_next < 0.0) v2_next = 0.0;
+      double v_next = sqrt(v2_next);
+      double dt = (v_next - v) / a; if (dt < 0.0) dt = 0.0;
+      v = v_next;
+      return dt;
+    };
+
+    double dt_sec = 0.0;
+    // Read current profile once for this step
+    const MotionProfile prof = get_motion_profile();
+
+    switch (phase) {
+      case ACCEL:
+        if (prof == PROF_S_CURVE) {
+          if (steps_acc == 0) { d_cur = d_cruise; }
+          else {
+            float t = (float)i_in_phase / (float)steps_acc;
+            float s = smooth5(t);
+            d_cur = (int32_t)lrintf((1.0f - s) * (float)d_start + s * (float)d_cruise);
+          }
+          dt_sec = d_cur / 1e6;
+        } else if (prof == PROF_TRAPEZOID_PERIOD) {
+          d_cur = steps_acc ? (d_start + (int32_t)((int64_t)slope_acc * (int64_t)i_in_phase)) : d_cruise;
+          dt_sec = d_cur / 1e6;
+        } else { // PROF_CONSTACC_SPEED
+          dt_sec = step_interval_constacc(v_cur, a_acc);
+        }
+        break;
+
+      case CRUISE:
+        if (prof == PROF_CONSTACC_SPEED) {
+          dt_sec = (v_cruise_s > 1e-9) ? (1.0 / v_cruise_s) : 0.0;
+        } else {
+          d_cur = d_cruise;
+          dt_sec = d_cur / 1e6;
+        }
+        break;
+
+      case DECEL:
+        if (prof == PROF_S_CURVE) {
+          if (steps_decel == 0) { d_cur = d_end; }
+          else {
+            float t = (float)i_in_phase / (float)steps_decel;
+            float s = smooth5(t);
+            d_cur = (int32_t)lrintf((1.0f - s) * (float)d_cruise + s * (float)d_end);
+          }
+          dt_sec = d_cur / 1e6;
+        } else if (prof == PROF_TRAPEZOID_PERIOD) {
+          d_cur = steps_decel ? (d_cruise + (int32_t)((int64_t)slope_dec * (int64_t)i_in_phase)) : d_end;
+          dt_sec = d_cur / 1e6;
+        } else { // PROF_CONSTACC_SPEED
+          dt_sec = step_interval_constacc(v_cur, a_dec);
+        }
+        break;
+
+      default: break;
+    }
+
+    // Convert to µs and pack
+    if (d_cur < 0) d_cur = 0; // relevant for non-const-acc paths
+    const uint32_t PULSE_US = 20;
+    uint32_t dt_us = (prof == PROF_CONSTACC_SPEED) 
+                      ? (uint32_t)llround(dt_sec * 1e6)
+                      : (uint32_t)d_cur;
+    uint32_t extra = (dt_us > PULSE_US) ? (dt_us - PULSE_US) : 0u;
+
+    out[n++] = make_cmd(dx, dy, dz, sxp, syp, szp, extra);
+    total_steps_generated++;
+
+    // Advance phase
+    i_in_phase++;
+
+    switch (phase) {
+      case ACCEL:
+        if (i_in_phase >= steps_acc) {
+          phase = (steps_cruise ? CRUISE : (steps_decel ? DECEL : DONE));
+          i_in_phase = 0;
+          if (prof == PROF_CONSTACC_SPEED) v_cur = v_cruise_s; // snap to boundary
+          d_cur = d_cruise;
+        }
+        break;
+      case CRUISE:
+        if (i_in_phase >= steps_cruise) {
+          phase = (steps_decel ? DECEL : DONE);
+          i_in_phase = 0;
+          if (prof == PROF_CONSTACC_SPEED) v_cur = v_cruise_s;
+          d_cur = d_cruise;
+        }
+        break;
+      case DECEL:
+        if (i_in_phase >= steps_decel) {
+          phase = DONE;
+          if (prof == PROF_CONSTACC_SPEED) v_cur = v_end_s; // arrive at end speed
+          d_cur = d_end;
+        }
+        break;
+      default: break;
+    }
   }
-};
+  return n;
+}
+
 
 TrapS g_gen;  // definitie hier, waar TrapS bekend is
 
