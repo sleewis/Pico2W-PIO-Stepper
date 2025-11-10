@@ -1,0 +1,92 @@
+*** Begin Patch
+*** Update File: motion.cpp
+@@
+   total_steps_generated = 0;
+ 
+   // --- Precompute for profiles ---
+-  // Trapezoid in period-space
+-  slope_acc = (steps_acc   ? (int32_t)((int64_t)d_cruise - d_start)  / (int32_t)steps_acc   : 0);
+-  slope_dec = (steps_decel ? (int32_t)((int64_t)d_end    - d_cruise) / (int32_t)steps_decel : 0);
+-
+-  // Constant-acc in speed-space (steps/s)
+-  v_start   = (d_start  > 0) ? (1e6 / (double)d_start)  : 1e9;
+-  v_cruise_s= (d_cruise > 0) ? (1e6 / (double)d_cruise) : v_start;
+-  v_end_s   = (d_end    > 0) ? (1e6 / (double)d_end)    : v_cruise_s;
+-
+-  a_acc = (steps_acc   ? ( (v_cruise_s*v_cruise_s - v_start*v_start) / (2.0 * (double)steps_acc) ) : 0.0);
+-  a_dec = (steps_decel ? ( (v_end_s*v_end_s      - v_cruise_s*v_cruise_s) / (2.0 * (double)steps_decel) ) : 0.0);
++  // Trapezoid in period-space (initially computed from move hints)
++  slope_acc = (steps_acc   ? (int32_t)((int64_t)d_cruise - d_start)  / (int32_t)steps_acc   : 0);
++  slope_dec = (steps_decel ? (int32_t)((int64_t)d_end    - d_cruise) / (int32_t)steps_decel : 0);
++
++  // Constant-acc in speed-space (steps/s) -- boundary speeds
++  v_start   = (d_start  > 0) ? (1e6 / (double)d_start)  : 1e9;
++  v_cruise_s= (d_cruise > 0) ? (1e6 / (double)d_cruise) : v_start;
++  v_end_s   = (d_end    > 0) ? (1e6 / (double)d_end)    : v_cruise_s;
++
++  // --- Prefer physics-based accel/decel sizing ---
++  // Keep accel_frac/decel_frac as user hints / upper bounds, but compute
++  // accel/decel step counts using the configured physical accel A_MAX_STEPS_S2.
++  uint32_t max_steps_acc_frac   = (uint32_t)lrintf(m.accel_frac * (float)Nmax);
++  uint32_t max_steps_decel_frac = (uint32_t)lrintf(m.decel_frac * (float)Nmax);
++  if (max_steps_acc_frac + max_steps_decel_frac > Nmax) {
++    max_steps_acc_frac = Nmax/2;
++    max_steps_decel_frac = Nmax - max_steps_acc_frac;
++  }
++
++  double a_max = (double)A_MAX_STEPS_S2;
++  if (a_max <= 0.0) a_max = 1e9; // guard against bad config
++
++  // Steps required to reach cruise under a_max (continuous formula)
++  double steps_needed_acc = 0.0, steps_needed_dec = 0.0;
++  if (v_cruise_s > v_start) steps_needed_acc = (v_cruise_s*v_cruise_s - v_start*v_start) / (2.0 * a_max);
++  if (v_cruise_s > v_end_s)  steps_needed_dec = (v_cruise_s*v_cruise_s - v_end_s*v_end_s) / (2.0 * a_max);
++
++  uint32_t steps_acc_phys = (uint32_t)lrint(fmax(0.0, steps_needed_acc));
++  uint32_t steps_decel_phys = (uint32_t)lrint(fmax(0.0, steps_needed_dec));
++
++  if ((uint64_t)steps_acc_phys + (uint64_t)steps_decel_phys <= (uint64_t)Nmax) {
++    // Can reach requested cruise: use physics-based counts but respect fraction caps
++    steps_acc = (uint32_t)fmin((double)steps_acc_phys, (double)max_steps_acc_frac);
++    steps_decel = (uint32_t)fmin((double)steps_decel_phys, (double)max_steps_decel_frac);
++    // ensure we don't overflow
++    if ((uint64_t)steps_acc + (uint64_t)steps_decel > (uint64_t)Nmax) {
++      steps_acc = Nmax/2;
++      steps_decel = Nmax - steps_acc;
++    }
++    steps_cruise = Nmax - steps_acc - steps_decel;
++    // v_cruise_s remains requested cruise
++  } else {
++    // Too short for requested cruise -> triangular profile, compute reduced peak velocity
++    // Solve for v_peak^2 from: Nmax = (2*v_peak^2 - v_start^2 - v_end^2) / (2*a_max)
++    double v_peak_sq = (a_max * (double)Nmax) + (v_start*v_start + v_end_s*v_end_s) * 0.5;
++    if (v_peak_sq < 0.0) v_peak_sq = 0.0;
++    double v_peak = sqrt(v_peak_sq);
++
++    double steps_acc_d = (v_peak*v_peak - v_start*v_start) / (2.0 * a_max);
++    double steps_dec_d = (v_peak*v_peak - v_end_s*v_end_s) / (2.0 * a_max);
++    steps_acc = (uint32_t)lrint(fmax(0.0, steps_acc_d));
++    steps_decel = (uint32_t)lrint(fmax(0.0, steps_dec_d));
++    // guard rounding issues
++    if ((uint64_t)steps_acc + (uint64_t)steps_decel > (uint64_t)Nmax) {
++      double tot = (double)(steps_acc + steps_decel);
++      if (tot > 0.0) {
++        steps_acc = (uint32_t)lrint(((double)steps_acc / tot) * (double)Nmax);
++        steps_decel = Nmax - steps_acc;
++      } else {
++        steps_acc = Nmax/2;
++        steps_decel = Nmax - steps_acc;
++      }
++    }
++    steps_cruise = 0;
++    v_cruise_s = v_peak;
++  }
++
++  // Recompute trapezoid slopes now that steps_acc/steps_decel are final
++  slope_acc = (steps_acc   ? (int32_t)((int64_t)d_cruise - d_start)  / (int32_t)steps_acc   : 0);
++  slope_dec = (steps_decel ? (int32_t)((int64_t)d_end    - d_cruise) / (int32_t)steps_decel : 0);
++
++  // Speed-space accelerations (per-step)
++  a_acc = (steps_acc   ? ( (v_cruise_s*v_cruise_s - v_start*v_start) / (2.0 * (double)steps_acc) ) : 0.0);
++  a_dec = (steps_decel ? ( (v_end_s*v_end_s      - v_cruise_s*v_cruise_s) / (2.0 * (double)steps_decel) ) : 0.0);
+*** End Patch

@@ -58,13 +58,31 @@ Each “motion word” (32-bit) encodes one step event and its timing:
 
 ```
 / (repo root)
-├─ Pico2W_Simple_Stepper3.ino     # main sketch (your file name may differ)
-├─ stepper_1sm.pio                # PIO program (auto-compiled to header)
-└─ README.md
+    ├── bootbanner.cpp
+    ├── bootBanner.h
+    ├── config.cpp
+    ├── config.h
+    ├── gcode.cpp
+    ├── gcode.h
+    ├── homing.cpp
+    ├── homing.h
+    ├── motion.cpp
+    ├── motion.h
+    ├── Pico2W-PIO-Stepper.ino
+    ├── planner_math.h
+    ├── queue.cpp
+    ├── queue.h
+    ├── README.md
+    ├── SerialDevice.h
+    ├── state.cpp
+    ├── state.h
+    ├── stepper_1sm.pio
+    ├── stepper_1sm.pio.h
+    ├── types.h
+    ├── units.cpp
+    └── units.h
+
 ```
-
----
-
 ## Build
 
 1. Install the **Earle Philhower “Arduino-Pico”** core.
