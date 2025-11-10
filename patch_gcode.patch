@@ -1,0 +1,26 @@
+*** Begin Patch
+*** Update File: gcode.cpp
+@@
+ #include "gcode.h"
+ #include "units.h"
++#include "planner_math.h"
+ 
+@@
+     if(s.startsWith("G0") || s.startsWith("W")){
+       m.d_start_us=20'000;
+       m.d_cruise_us=3000;
+       m.d_end_us=20'000;
+     }
+     else {
+       m.d_cruise_us=(uint32_t)roundf(1e6f/f_steps_s);
+-      m.d_start_us=(uint32_t)roundf(m.d_cruise_us*3.5f);
+-      m.d_end_us=m.d_start_us;
++      // Compute a start period based on a fraction of cruise speed, but floor to MIN_CORNER_SPEED.
++      // Using a fraction keeps a reasonably fast start without the previous large 3.5× multiplier.
++      float cruise_v = f_steps_s; // steps/s
++      float start_v = fmaxf(cruise_v * 0.25f, MIN_CORNER_SPEED); // heuristic: 25% of cruise or MIN_CORNER_SPEED
++      m.d_start_us = period_us_from_speed(start_v);
++      m.d_end_us = m.d_start_us;
+       lastFeed_units_s=F_units_s;
+     }
+*** End Patch
